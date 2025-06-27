@@ -51,7 +51,6 @@ import org.apache.kafka.clients.consumer.ConsumerPartitionAssignor;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.oracle.okafka.clients.consumer.TxEQAssignor;
 import org.oracle.okafka.common.Node;
-import org.oracle.okafka.common.errors.ConnectionException;
 import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicPartition;
@@ -331,7 +330,8 @@ public final class AQKafkaConsumer extends AQClient{
           log.debug("Committing now for node " + node.toString());
 					Boolean ltwtSub = configs.getBoolean(ConsumerConfig.ORACLE_CONSUMER_LIGHTWEIGHT);
 					if(!ltwtSub.equals(true)) {
-						jmsSession =consumers.getSession();
+						jmsSession = consumers.getSession();
+						
 						if(jmsSession != null)
 						{
 							log.debug("Committing now for node " + node.toString());
@@ -364,7 +364,7 @@ public final class AQKafkaConsumer extends AQClient{
 		return createCommitResponse(request, nodes, offsets, result, error);
 	}
 
-	private void commitOffsetsLightWeightSub(Node node, String topic, Map<TopicPartition, OffsetAndMetadata> offsets) {
+	private void commitOffsetsLightWeightSub(Node node, String topic, Map<TopicPartition, OffsetAndMetadata> offsets) throws Exception {
      	int size = offsets.size();
 		int[] partitions = new int[size];
 		int[] priorities = new int[size];
@@ -385,7 +385,7 @@ public final class AQKafkaConsumer extends AQClient{
 		commitSyncAll(node, topic, partitions, priorities, subshards, sequences);
 	}
 
-	public void CommitSync(Node node, String topic, int partition_id, int priority, 
+	public void commitSync(Node node, String topic, int partition_id, int priority, 
 			long subshard_id, long seq_num ) {
 
 		try {
@@ -407,7 +407,7 @@ public final class AQKafkaConsumer extends AQClient{
 	}
 
 	public void commitSyncAll(Node node, String topic, int[] partition_id, int[] priority, 
-			long[] subshard_id, long[] seq_num ) {
+			long[] subshard_id, long[] seq_num ) throws Exception {
 
 		try {
 			OracleConnection oracleCon = (OracleConnection) getConnection(node);
@@ -430,6 +430,7 @@ public final class AQKafkaConsumer extends AQClient{
 			log.debug("Light weight CommitSyncAll executed for topic: {}, partitions: {}", topic, partition_id.length);
 		} catch(Exception ex) {
 			log.error("Error in light weight commitSyncAll for topic: " + topic + ", node: " + node, ex);
+			throw ex;
 		}
 	}
 
@@ -1854,59 +1855,33 @@ public final class AQKafkaConsumer extends AQClient{
 		public TopicConsumers(Node node) throws JMSException {
 			this(node, TopicSession.AUTO_ACKNOWLEDGE);
 		}
-		public TopicConsumers(Node node,int mode) throws JMSException {
-			
-			this.node = node;
 
+		public TopicConsumers(Node node, int mode) throws JMSException {
+			this.node = node;
 			try {
 				conn = createTopicConnection(node);
 				sess = createTopicSession(mode);
-				Connection oConn = ((AQjmsSession) sess).getDBConnection();
-				String instanceName = ((oracle.jdbc.internal.OracleConnection) oConn).getServerSessionInfo()
-						.getProperty("INSTANCE_NAME");
-				if (metadata.isBootstrap()) {
-					String dbHost = ((oracle.jdbc.internal.OracleConnection) oConn).getServerSessionInfo()
-							.getProperty("AUTH_SC_SERVER_HOST");
-					int instId = Integer.parseInt(((oracle.jdbc.internal.OracleConnection) oConn).getServerSessionInfo()
-							.getProperty("AUTH_INSTANCE_NO"));
-					String serviceName = ((oracle.jdbc.internal.OracleConnection) oConn).getServerSessionInfo()
-							.getProperty("SERVICE_NAME");
-					String user = oConn.getMetaData().getUserName();
+				Connection conn = ((AQjmsSession) sess).getDBConnection();
 
-					String oldHost = node.host();
-					node.setHost(dbHost + oldHost.substring(oldHost.indexOf('.')));
-					node.setId(instId);
-					node.setService(serviceName);
-					node.setInstanceName(instanceName);
-					node.setUser(user);
-					node.updateHashCode();
-				}
+				ConnectionUtils.updateNodeInfo(node, conn);
+				
 				try {
-					String sessionId = ((oracle.jdbc.internal.OracleConnection) oConn).getServerSessionInfo()
-							.getProperty("AUTH_SESSION_ID");
-					String serialNum = ((oracle.jdbc.internal.OracleConnection) oConn).getServerSessionInfo()
-							.getProperty("AUTH_SERIAL_NUM");
-					String serverPid = ((oracle.jdbc.internal.OracleConnection) oConn).getServerSessionInfo()
-							.getProperty("AUTH_SERVER_PID");
-
-					log.info("Database Consumer Session Info: " + sessionId + "," + serialNum + ". Process Id "
-							+ serverPid + " Instance Name " + instanceName);
-
-					try {
-						this.dbVersion = ConnectionUtils.getDBVersion(oConn);
-						this.lightWeightSub = configs.getBoolean(ConsumerConfig.ORACLE_CONSUMER_LIGHTWEIGHT);
-							
-					}catch(Exception e)
-					{
-						log.error("Exception whle fetching DB Version and lightweight consumer config" + e);
-					}
-
+					String connInfo = ConnectionUtils.getDatabaseSessionInfo(conn);
+					log.info("Database Consumer "+connInfo);
 				} catch (Exception e) {
 					log.error("Exception wnile getting database session information " + e);
 				}
+				try {
+					this.dbVersion = ConnectionUtils.getDBVersion(conn);
+					this.lightWeightSub = configs.getBoolean(ConsumerConfig.ORACLE_CONSUMER_LIGHTWEIGHT);
+						
+				}catch(Exception e)
+				{
+					log.error("Exception whle fetching DB Version and lightweight consumer config" + e);
+				}
 
-			}catch(Exception e)
-			{
+
+			} catch (Exception e) {
 				log.error("Exception while getting instance id from conneciton " + e, e);
 			}
 
