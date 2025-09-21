@@ -35,7 +35,6 @@ import org.oracle.okafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.protocol.ApiMessage;
 import org.apache.kafka.common.requests.AbstractResponse;
-import org.apache.kafka.common.utils.Utils;
 
 public class MetadataRequest extends AbstractRequest {
 	public static class Builder extends AbstractRequest.Builder<MetadataRequest> {
@@ -101,22 +100,19 @@ public class MetadataRequest extends AbstractRequest {
 		}
 
 		@Override
-		public MetadataRequest build() {
-			return new MetadataRequest(topics, topicIds, allowAutoTopicCreation, teqParaTopic);
-		}
-
-		@Override
-		public String toString() {
-			StringBuilder bld = new StringBuilder();
-			bld.append("(type=metadataRequest").append(", topics=(")
-					.append((topics == null) ? "null" : Utils.join(topics, ", ")).append(")");
-			return bld.toString();
-		}
-
-		@Override
 		public MetadataRequest build(short version) {
-			return build();
+			return new MetadataRequest(topics, topicIds, allowAutoTopicCreation, teqParaTopic, version);
 		}
+		
+		@Override
+        public String toString() {
+            StringBuilder bld = new StringBuilder();
+            bld.append("(type=metadataRequest").
+            append(", topics=(").append( (topics==null) ? "null" :  String.join(",",topics))
+            .append(")");
+            return bld.toString();
+        }
+
 	}
 
 	private final List<String> teqParaTopic;
@@ -125,8 +121,8 @@ public class MetadataRequest extends AbstractRequest {
 	private final boolean allowAutoTopicCreation;
 
 	private MetadataRequest(List<String> topics, List<Uuid> topicIds, boolean allowAutoTopicCreation,
-			List<String> teqParaTopic) {
-		super(ApiKeys.METADATA, (short) 1);
+			List<String> teqParaTopic, short version) {
+		super(ApiKeys.METADATA, version);
 		this.topics = topics;
 		this.topicIds = topicIds;
 		this.allowAutoTopicCreation = allowAutoTopicCreation;

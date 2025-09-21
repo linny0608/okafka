@@ -44,7 +44,9 @@ import oracle.jms.AQjmsSession;
 import oracle.jms.AQjmsTopicConnectionFactory;
 
 public class ConnectionUtils {
-
+	
+	static final int CONNECTION_VALIDATION_TIMEOUT_SEC = 5;
+	
 	public static String createUrl(Node node, AbstractConfig configs) {
 
 		if( !configs.getString(CommonClientConfigs.SECURITY_PROTOCOL_CONFIG).equalsIgnoreCase("PLAINTEXT")) {
@@ -125,13 +127,21 @@ public class ConnectionUtils {
 	public static boolean isSessionClosed(AQjmsSession sess) {
 		Connection con;
 		try {
-			con = ((oracle.jms.AQjmsSession)sess).getDBConnection();
-			if(con == null || con.isClosed())
+			con = sess.getDBConnection();
+			if (con == null || isConnectionClosed(con))
 				return true;
-		} catch (JMSException | SQLException e) {
+		} catch (JMSException e) {
 			return true;
 		}
 		return false;
+	}
+	
+	public static boolean isConnectionClosed(Connection con) {
+		try {
+			return con == null || con.isClosed() || !(con.isValid(CONNECTION_VALIDATION_TIMEOUT_SEC));
+		} catch (SQLException e) {
+			return true;
+		}
 	}
 
 	public static String getUsername(AbstractConfig configs) {
@@ -173,9 +183,10 @@ public class ConnectionUtils {
 		int instId = Integer.parseInt(oConn.getServerSessionInfo().getProperty("AUTH_INSTANCE_NO"));
 		String serviceName = oConn.getServerSessionInfo().getProperty("SERVICE_NAME");
 		String user = oConn.getMetaData().getUserName();
-
-		String oldHost = node.host();
-		node.setHost(dbHost + oldHost.substring(oldHost.indexOf('.')));
+		String fullHostName = getFullHostname(oConn);
+		if(fullHostName != null)
+			dbHost = fullHostName;
+		node.setHost(dbHost);
 		node.setId(instId);
 		node.setService(serviceName);
 		node.setInstanceName(instanceName);
@@ -192,7 +203,28 @@ public class ConnectionUtils {
 		String connInfo = "Session_Info:"+ sessionId +","+serialNum+". Process Id:" + serverPid +". Instance Name:"+instanceName;
 		return connInfo;
 	}
-
+	
+	public static String getFullHostname(Connection con) throws SQLException {
+		String query = "select value from gv$listener_network where inst_id = "
+				+ "(SELECT SYS_CONTEXT('USERENV', 'INSTANCE') AS instance_number FROM DUAL) and upper(type) = 'LOCAL LISTENER'";
+		String str = "";
+		PreparedStatement stmt = null;
+		ResultSet rs = null;
+		try {
+			stmt = con.prepareStatement(query);
+			stmt.execute();
+			rs = stmt.getResultSet();
+			if (rs.next())
+				str = rs.getString(1);
+		} finally {
+			if (rs != null)
+				rs.close();
+			if (stmt != null)
+				stmt.close();
+		}
+		return TNSParser.getProperty(str.toUpperCase(), "HOST");
+	}
+	
 	public static String getDBVersion(Connection conn) throws Exception
 	{
 		String dbVersionQuery = "select version_full from PRODUCT_COMPONENT_VERSION where product like  'Oracle Database%'";

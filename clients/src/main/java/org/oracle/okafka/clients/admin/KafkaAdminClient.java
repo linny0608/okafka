@@ -36,6 +36,8 @@ import org.apache.kafka.clients.ClientUtils;
 import org.apache.kafka.clients.admin.AbortTransactionOptions;
 import org.apache.kafka.clients.admin.AbortTransactionResult;
 import org.apache.kafka.clients.admin.AbortTransactionSpec;
+import org.apache.kafka.clients.admin.AddRaftVoterOptions;
+import org.apache.kafka.clients.admin.AddRaftVoterResult;
 import org.apache.kafka.clients.admin.AlterClientQuotasOptions;
 import org.apache.kafka.clients.admin.AlterClientQuotasResult;
 import org.apache.kafka.clients.admin.AlterConfigOp;
@@ -123,9 +125,12 @@ import org.apache.kafka.clients.admin.NewPartitionReassignment;
 import org.apache.kafka.clients.admin.NewPartitions;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.admin.OffsetSpec;
+import org.apache.kafka.clients.admin.RaftVoterEndpoint;
 import org.apache.kafka.clients.admin.RecordsToDelete;
 import org.apache.kafka.clients.admin.RemoveMembersFromConsumerGroupOptions;
 import org.apache.kafka.clients.admin.RemoveMembersFromConsumerGroupResult;
+import org.apache.kafka.clients.admin.RemoveRaftVoterOptions;
+import org.apache.kafka.clients.admin.RemoveRaftVoterResult;
 import org.apache.kafka.clients.admin.RenewDelegationTokenOptions;
 import org.apache.kafka.clients.admin.RenewDelegationTokenResult;
 import org.apache.kafka.clients.admin.TopicDescription;
@@ -189,6 +194,8 @@ import org.apache.kafka.common.quota.ClientQuotaAlteration;
 import org.apache.kafka.common.quota.ClientQuotaFilter;
 import org.apache.kafka.common.requests.AbstractResponse;
 import org.oracle.okafka.common.requests.AbstractRequest;
+import org.oracle.okafka.common.requests.CreatePartitionsRequest;
+import org.oracle.okafka.common.requests.CreatePartitionsResponse;
 import org.oracle.okafka.common.requests.CreateTopicsRequest;
 import org.oracle.okafka.common.requests.CreateTopicsResponse;
 import org.oracle.okafka.common.requests.DeleteGroupsRequest;
@@ -1142,11 +1149,12 @@ public class KafkaAdminClient extends AdminClient {
 		private void handleResponse(long now, Call call, ClientResponse response) {
 
 			try {
+				List<Call> calls = callsInFlight.get(org.oracle.okafka.common.Node.NODE_ID_STRING_PREFIX + response.destination());
+				calls.remove(call);
 				if (response.wasDisconnected()) {
 					client.disconnected((org.oracle.okafka.common.Node) (metadataManager
 							.nodeById(Integer.parseInt(response.destination()))), now);
 					metadataManager.requestUpdate();
-
 				}
 				call.handleResponse(response.responseBody());
 			} catch (Throwable t) {
@@ -1184,7 +1192,7 @@ public class KafkaAdminClient extends AdminClient {
 						log.debug("Closing connection to {} to time out {}", nodeId, call);
 						call.aborted = true;
 						client.disconnect((org.oracle.okafka.common.Node) metadataManager
-								.nodeById(Integer.parseInt(nodeId.replace("INSTANCE_", ""))));
+								.nodeById(Integer.parseInt(nodeId.replace(org.oracle.okafka.common.Node.NODE_ID_STRING_PREFIX, ""))));
 						numTimedOut++;
 						// We don't remove anything from the callsInFlight data structure. Because the
 						// connection
@@ -1489,6 +1497,10 @@ public class KafkaAdminClient extends AdminClient {
 				@Override
 				public void handleResponse(org.apache.kafka.common.requests.AbstractResponse abstractResponse) {
 					MetadataResponse response = (MetadataResponse) abstractResponse;
+					if(response.getException() != null) {
+						handleFailure(response.getException());
+						return;
+					}
 					long now = time.milliseconds();
 					metadataManager.update(response.cluster(), now);
 
@@ -1731,17 +1743,16 @@ public class KafkaAdminClient extends AdminClient {
 			@Override
 			public void handleResponse(org.apache.kafka.common.requests.AbstractResponse abstractResponse) {
 				CreateTopicsResponse response = (CreateTopicsResponse) abstractResponse;
+				Exception exception = response.getResult();
 
-				// Handle server responses for particular topics.
-				for (Map.Entry<String, Exception> entry : response.errors().entrySet()) {
-					KafkaFutureImpl<TopicMetadataAndConfig> future = topicFutures.get(entry.getKey());
-					Map<String,Uuid> topicIdMap = response.topicIdMap();
-					if (future == null) {
-						log.warn("Server response mentioned unknown topic {}", entry.getKey());
-					} else {
-						Exception exception = entry.getValue();
-						if (exception != null) {
-							future.completeExceptionally(exception);
+				if (exception == null || exception instanceof DisconnectException) {
+					// Handle server responses for particular topics.
+					for (Map.Entry<String, Exception> entry : response.errors().entrySet()) {
+						KafkaFutureImpl<TopicMetadataAndConfig> future = topicFutures.get(entry.getKey());
+						Map<String, Uuid> topicIdMap = response.topicIdMap();
+						Exception topicException = entry.getValue();
+						if (topicException != null) {
+							future.completeExceptionally(topicException);
 						} else {
 							String topic = entry.getKey();
 							TopicMetadataAndConfig topicMetadataAndConfig = new TopicMetadataAndConfig(
@@ -1749,20 +1760,12 @@ public class KafkaAdminClient extends AdminClient {
 									topicsMap.get(topic).replicationFactor, null);
 							future.complete(topicMetadataAndConfig);
 						}
+						topicsMap.remove(entry.getKey());
 					}
-				}
-				// The server should send back a response for every topic. But do a sanity check
-				// anyway.
-				for (Map.Entry<String, KafkaFutureImpl<TopicMetadataAndConfig>> entry : topicFutures.entrySet()) {
-					KafkaFutureImpl<TopicMetadataAndConfig> future = entry.getValue();
-					if (!future.isDone()) {
-						if (response.getResult() != null) {
-							future.completeExceptionally(response.getResult());
-						} else
-							future.completeExceptionally(new ApiException(
-									"The server response did not " + "contain a reference to node " + entry.getKey()));
-					}
-				}
+					if (exception instanceof DisconnectException)
+						this.fail(time.milliseconds(), exception);
+				} else
+					handleFailure(exception);
 			}
 
 			@Override
@@ -1856,32 +1859,24 @@ public class KafkaAdminClient extends AdminClient {
 			@Override
 			void handleResponse(org.apache.kafka.common.requests.AbstractResponse abstractResponse) {
 				DeleteTopicsResponse response = (DeleteTopicsResponse) abstractResponse;
-				// Handle server responses for particular topics.
-				for (Map.Entry<String, SQLException> entry : response.topicErrormap().entrySet()) {
-					KafkaFutureImpl<Void> future = futures.get(entry.getKey());
-					if (future == null) {
-						log.warn("Server response mentioned unknown topic {}", entry.getKey());
-					} else {
-						SQLException exception = entry.getValue();
-						if (exception != null) {
-							future.completeExceptionally(new KafkaException(exception.getMessage()));
+				Exception exception = response.getResult();
+				
+				if (exception == null || exception instanceof DisconnectException) {
+					// Handle server responses for particular topics.
+					for (Map.Entry<String, SQLException> entry : response.topicErrormap().entrySet()) {
+						KafkaFutureImpl<Void> future = futures.get(entry.getKey());
+						SQLException topicException = entry.getValue();
+						if (topicException != null) {
+							future.completeExceptionally(new KafkaException(topicException.getMessage()));
 						} else {
 							future.complete(null);
 						}
+						topics.remove(entry.getKey());
 					}
-				}
-				// The server should send back a response for every topic. But do a sanity check
-				// anyway.
-				for (Map.Entry<String, KafkaFutureImpl<Void>> entry : futures.entrySet()) {
-					KafkaFutureImpl<Void> future = entry.getValue();
-					if (!future.isDone()) {
-						if (response.getResult() != null) {
-							future.completeExceptionally(response.getResult());
-						} else
-							future.completeExceptionally(new ApiException(
-									"The server response did not " + "contain a reference to node " + entry.getKey()));
-					}
-				}
+					if (exception instanceof DisconnectException)
+						this.fail(time.milliseconds(), exception);
+				} else
+					handleFailure(exception);
 			}
 
 			@Override
@@ -1906,33 +1901,24 @@ public class KafkaAdminClient extends AdminClient {
 			@Override
 			void handleResponse(org.apache.kafka.common.requests.AbstractResponse abstractResponse) {
 				DeleteTopicsResponse response = (DeleteTopicsResponse) abstractResponse;
-				// Handle server responses for particular topics.
-				for (Map.Entry<Uuid, SQLException> entry : response.topicIdErrorMap().entrySet()) {
-					KafkaFutureImpl<Void> future = futures.get(entry.getKey());
-					if (future == null) {
-						log.warn("Server response mentioned unknown topic {}", entry.getKey());
-					} else {
-						SQLException exception = entry.getValue();
-						if (exception != null) {
-							future.completeExceptionally(new KafkaException(exception.getMessage()));
+				Exception exception = response.getResult();
+
+				if (exception == null || exception instanceof DisconnectException) {
+					// Handle server responses for particular topics.
+					for (Map.Entry<Uuid, SQLException> entry : response.topicIdErrorMap().entrySet()) {
+						KafkaFutureImpl<Void> future = futures.get(entry.getKey());
+						SQLException topicException = entry.getValue();
+						if (topicException != null) {
+							future.completeExceptionally(new KafkaException(topicException.getMessage()));
 						} else {
 							future.complete(null);
 						}
+						topicIds.remove(entry.getKey());
 					}
-				}
-				
-				// The server should send back a response for every topic. But do a sanity check
-				// anyway.
-				for (Map.Entry<Uuid, KafkaFutureImpl<Void>> entry : futures.entrySet()) {
-					KafkaFutureImpl<Void> future = entry.getValue();
-					if (!future.isDone()) {
-						if (response.getResult() != null) {
-							future.completeExceptionally(response.getResult());
-						} else
-							future.completeExceptionally(new ApiException(
-									"The server response did not " + "contain a reference to node " + entry.getKey()));
-					}
-				}
+					if (exception instanceof DisconnectException)
+						this.fail(time.milliseconds(), exception);
+				} else
+					handleFailure(exception);
 			}
 
 			@Override
@@ -1969,7 +1955,9 @@ public class KafkaAdminClient extends AdminClient {
 			@Override
 			void handleResponse(AbstractResponse abstractResponse) {
 				MetadataResponse response = (MetadataResponse) abstractResponse;
-				if (response.getException() == null) {
+				Exception exception = response.getException();
+				
+				if (exception == null) {
 					Map<String, TopicListing> topicListing = new HashMap<>();
 					Map<String, TopicTeqParameters> topicTeqParameters = response.teqParameters();
 
@@ -1981,13 +1969,16 @@ public class KafkaAdminClient extends AdminClient {
 
 					topicListingFuture.complete(topicListing);
 				} else {
-					handleFailure(response.getException());
+					handleFailure(exception);
 				}
 			}
 
 			@Override
 			void handleFailure(Throwable throwable) {
-				topicListingFuture.completeExceptionally(throwable);
+				if (throwable instanceof DisconnectException)
+					this.fail(time.milliseconds(), throwable);
+				else
+					topicListingFuture.completeExceptionally(throwable);
 			}
 		}, now);
 
@@ -2045,55 +2036,58 @@ public class KafkaAdminClient extends AdminClient {
 					@Override
 					void handleResponse(AbstractResponse abstractResponse) {
 						MetadataResponse response = (MetadataResponse) abstractResponse;
-						if (response.getException() != null) {
+						if (response.getException() == null) {
+							List<PartitionInfo> partitionInfo = response.partitions();
+							Map<Uuid, Exception> errorsPerTopicId = response.topicIdErrors();
+							Map<String, TopicTeqParameters> topicTeqParameters = response.teqParameters();
+							Map<String, Uuid> topicNameIdMap = response.getTopicsIdMap();
+							Map<Uuid, String> topicIdNameMap = new HashMap<>();
+							topicNameIdMap.forEach((key, value) -> topicIdNameMap.put(value, key));
+							Map<String, List<TopicPartitionInfo>> topicPartitions = new HashMap<>();
+
+							for (int i = 0; i < partitionInfo.size(); i++) {
+								String name = partitionInfo.get(i).topic();
+								int partition = partitionInfo.get(i).partition();
+								Node leader = partitionInfo.get(i).leader();
+								Node[] replicas = partitionInfo.get(i).replicas();
+								Node[] inSyncReplicas = partitionInfo.get(i).inSyncReplicas();
+
+								TopicPartitionInfo topicPartitionInfo = new TopicPartitionInfo(partition, leader,
+										replicas != null ? new ArrayList<>(Arrays.asList(replicas)) : new ArrayList<>(),
+												inSyncReplicas != null ? new ArrayList<>(Arrays.asList(inSyncReplicas))
+														: new ArrayList<>());
+								if (topicPartitions.containsKey(name)) {
+									topicPartitions.get(name).add(topicPartitionInfo);
+								} else {
+									topicPartitions.put(name, new ArrayList<>(Arrays.asList(topicPartitionInfo)));
+								}
+							}
+
+							for (Map.Entry<Uuid, KafkaFutureImpl<TopicDescription>> entry : topicIdFutures.entrySet()) {
+
+								KafkaFutureImpl<TopicDescription> future = entry.getValue();
+
+								if (errorsPerTopicId.get(entry.getKey()) != null) {
+									future.completeExceptionally(errorsPerTopicId.get(entry.getKey()));
+								} else {
+									TopicDescription topicDescription = new org.oracle.okafka.clients.admin.TopicDescription(
+											topicIdNameMap.get(entry.getKey()), false,
+											topicPartitions.get(topicIdNameMap.get(entry.getKey())),
+											topicTeqParameters.get(topicIdNameMap.get(entry.getKey())), entry.getKey());
+
+									future.complete((TopicDescription) topicDescription);
+								}
+							}
+						} else
 							handleFailure(response.getException());
-						}
-						List<PartitionInfo> partitionInfo = response.partitions();
-						Map<Uuid, Exception> errorsPerTopicId = response.topicIdErrors();
-						Map<String, TopicTeqParameters> topicTeqParameters = response.teqParameters();
-						Map<String, Uuid> topicNameIdMap = response.getTopicsIdMap();
-						Map<Uuid, String> topicIdNameMap = new HashMap<>();
-						topicNameIdMap.forEach((key, value) -> topicIdNameMap.put(value, key));
-						Map<String, List<TopicPartitionInfo>> topicPartitions = new HashMap<>();
-
-						for (int i = 0; i < partitionInfo.size(); i++) {
-							String name = partitionInfo.get(i).topic();
-							int partition = partitionInfo.get(i).partition();
-							Node leader = partitionInfo.get(i).leader();
-							Node[] replicas = partitionInfo.get(i).replicas();
-							Node[] inSyncReplicas = partitionInfo.get(i).inSyncReplicas();
-
-							TopicPartitionInfo topicPartitionInfo = new TopicPartitionInfo(partition, leader,
-									replicas != null ? new ArrayList<>(Arrays.asList(replicas)) : new ArrayList<>(),
-									inSyncReplicas != null ? new ArrayList<>(Arrays.asList(inSyncReplicas))
-											: new ArrayList<>());
-							if (topicPartitions.containsKey(name)) {
-								topicPartitions.get(name).add(topicPartitionInfo);
-							} else {
-								topicPartitions.put(name, new ArrayList<>(Arrays.asList(topicPartitionInfo)));
-							}
-						}
-
-						for (Map.Entry<Uuid, KafkaFutureImpl<TopicDescription>> entry : topicIdFutures.entrySet()) {
-
-							KafkaFutureImpl<TopicDescription> future = entry.getValue();
-
-							if (errorsPerTopicId.get(entry.getKey()) != null) {
-								future.completeExceptionally(errorsPerTopicId.get(entry.getKey()));
-							} else {
-								TopicDescription topicDescription = new org.oracle.okafka.clients.admin.TopicDescription(
-										topicIdNameMap.get(entry.getKey()), false,
-										topicPartitions.get(topicIdNameMap.get(entry.getKey())),
-										topicTeqParameters.get(topicIdNameMap.get(entry.getKey())), entry.getKey());
-
-								future.complete((TopicDescription) topicDescription);
-							}
-						}
 					}
 
 					@Override
 					void handleFailure(Throwable throwable) {
-						completeAllExceptionally(topicIdFutures.values(), throwable);
+						if (throwable instanceof DisconnectException)
+							this.fail(time.milliseconds(), throwable);
+						else
+							completeAllExceptionally(topicIdFutures.values(), throwable);
 					}
 				}, now);
 		DescribeTopicsResult describeTopicsResult = new org.oracle.okafka.clients.admin.DescribeTopicsResult(
@@ -2138,52 +2132,55 @@ public class KafkaAdminClient extends AdminClient {
 					@Override
 					void handleResponse(AbstractResponse abstractResponse) {
 						MetadataResponse response = (MetadataResponse) abstractResponse;
-						if (response.getException() != null) {
+						if (response.getException() == null) {
+							List<PartitionInfo> partitionInfo = response.partitions();
+							Map<String, Exception> errorsPerTopic = response.topicErrors();
+							Map<String, TopicTeqParameters> topicTeqParameters = response.teqParameters();
+							Map<String, Uuid> topicNameIdMap = response.getTopicsIdMap();
+							Map<String, List<TopicPartitionInfo>> topicPartitions = new HashMap<>();
+							for (int i = 0; i < partitionInfo.size(); i++) {
+
+								String name = partitionInfo.get(i).topic();
+								int partition = partitionInfo.get(i).partition();
+								Node leader = partitionInfo.get(i).leader();
+								Node[] replicas = partitionInfo.get(i).replicas();
+								Node[] inSyncReplicas = partitionInfo.get(i).inSyncReplicas();
+
+								TopicPartitionInfo topicPartitionInfo = new TopicPartitionInfo(partition, leader,
+										replicas != null ? new ArrayList<>(Arrays.asList(replicas)) : new ArrayList<>(),
+												inSyncReplicas != null ? new ArrayList<>(Arrays.asList(inSyncReplicas))
+														: new ArrayList<>());
+								if (topicPartitions.containsKey(name)) {
+									topicPartitions.get(name).add(topicPartitionInfo);
+								} else {
+									topicPartitions.put(name, new ArrayList<>(Arrays.asList(topicPartitionInfo)));
+								}
+							}
+
+							for (Map.Entry<String, KafkaFutureImpl<TopicDescription>> entry : topicFutures.entrySet()) {
+
+								KafkaFutureImpl<TopicDescription> future = entry.getValue();
+
+								if (errorsPerTopic.get(entry.getKey()) != null) {
+									future.completeExceptionally(errorsPerTopic.get(entry.getKey()));
+								} else {
+									TopicDescription topicDescription = new org.oracle.okafka.clients.admin.TopicDescription(
+											entry.getKey(), false, topicPartitions.get(entry.getKey()),
+											topicTeqParameters.get(entry.getKey()), topicNameIdMap.get(entry.getKey()));
+
+									future.complete((TopicDescription) topicDescription);
+								}
+							}
+						} else
 							handleFailure(response.getException());
-						}
-						List<PartitionInfo> partitionInfo = response.partitions();
-						Map<String, Exception> errorsPerTopic = response.topicErrors();
-						Map<String, TopicTeqParameters> topicTeqParameters = response.teqParameters();
-						Map<String, Uuid> topicNameIdMap = response.getTopicsIdMap();
-						Map<String, List<TopicPartitionInfo>> topicPartitions = new HashMap<>();
-						for (int i = 0; i < partitionInfo.size(); i++) {
-
-							String name = partitionInfo.get(i).topic();
-							int partition = partitionInfo.get(i).partition();
-							Node leader = partitionInfo.get(i).leader();
-							Node[] replicas = partitionInfo.get(i).replicas();
-							Node[] inSyncReplicas = partitionInfo.get(i).inSyncReplicas();
-
-							TopicPartitionInfo topicPartitionInfo = new TopicPartitionInfo(partition, leader,
-									replicas != null ? new ArrayList<>(Arrays.asList(replicas)) : new ArrayList<>(),
-									inSyncReplicas != null ? new ArrayList<>(Arrays.asList(inSyncReplicas))
-											: new ArrayList<>());
-							if (topicPartitions.containsKey(name)) {
-								topicPartitions.get(name).add(topicPartitionInfo);
-							} else {
-								topicPartitions.put(name, new ArrayList<>(Arrays.asList(topicPartitionInfo)));
-							}
-						}
-
-						for (Map.Entry<String, KafkaFutureImpl<TopicDescription>> entry : topicFutures.entrySet()) {
-
-							KafkaFutureImpl<TopicDescription> future = entry.getValue();
-
-							if (errorsPerTopic.get(entry.getKey()) != null) {
-								future.completeExceptionally(errorsPerTopic.get(entry.getKey()));
-							} else {
-								TopicDescription topicDescription = new org.oracle.okafka.clients.admin.TopicDescription(
-										entry.getKey(), false, topicPartitions.get(entry.getKey()),
-										topicTeqParameters.get(entry.getKey()), topicNameIdMap.get(entry.getKey()));
-
-								future.complete((TopicDescription) topicDescription);
-							}
-						}
 					}
 
 					@Override
 					void handleFailure(Throwable throwable) {
-						completeAllExceptionally(topicFutures.values(), throwable);
+						if (throwable instanceof DisconnectException)
+							this.fail(time.milliseconds(), throwable);
+						else
+							completeAllExceptionally(topicFutures.values(), throwable);
 					}
 				}, now);
 		DescribeTopicsResult describeTopicsResult = new org.oracle.okafka.clients.admin.DescribeTopicsResult(null,
@@ -2228,28 +2225,30 @@ public class KafkaAdminClient extends AdminClient {
 					@Override
 					void handleResponse(AbstractResponse abstractResponse) {
 						ListOffsetsResponse response = (ListOffsetsResponse) abstractResponse;
-						if(response.getException()!=null) {
-							handleFailure(response.getException());
-						}
-						
-						Map<String, List<ListOffsetsPartitionResponse>> offsetResponseMap = response.getOffsetPartitionResponseMap();
-						for(Map.Entry<String, List<ListOffsetsPartitionResponse>> entry : offsetResponseMap.entrySet()) {
-							for(ListOffsetsPartitionResponse op : entry.getValue()) {
-								TopicPartition tp = new TopicPartition(entry.getKey(),op.partitionIndex());
-								if(op.getError()==null) {
-									ListOffsetsResultInfo offsetResult = new ListOffsetsResultInfo(op.offset(),op.timestamp(),null);
-									topicFutures.get(tp).complete(offsetResult);
-								}
-								else {
-									topicFutures.get(tp).completeExceptionally(op.getError());
+						if(response.getException() == null) {
+							Map<String, List<ListOffsetsPartitionResponse>> offsetResponseMap = response.getOffsetPartitionResponseMap();
+							for(Map.Entry<String, List<ListOffsetsPartitionResponse>> entry : offsetResponseMap.entrySet()) {
+								for(ListOffsetsPartitionResponse op : entry.getValue()) {
+									TopicPartition tp = new TopicPartition(entry.getKey(),op.partitionIndex());
+									if(op.getError()==null) {
+										ListOffsetsResultInfo offsetResult = new ListOffsetsResultInfo(op.offset(),op.timestamp(),null);
+										topicFutures.get(tp).complete(offsetResult);
+									}
+									else {
+										topicFutures.get(tp).completeExceptionally(op.getError());
+									}
 								}
 							}
-						}
+						} else
+							handleFailure(response.getException());
 					}
 
 					@Override
 					void handleFailure(Throwable throwable) {
-						completeAllExceptionally(topicFutures.values(), throwable);
+						if (throwable instanceof DisconnectException)
+							this.fail(time.milliseconds(), throwable);
+						else
+							completeAllExceptionally(topicFutures.values(), throwable);
 					}
 				}, now);
 		return new ListOffsetsResult(new HashMap<TopicPartition, KafkaFuture<ListOffsetsResultInfo>>(topicFutures));
@@ -2277,6 +2276,7 @@ public class KafkaAdminClient extends AdminClient {
 	public DeleteConsumerGroupsResult deleteConsumerGroups(Collection<String> groupIds,
 			DeleteConsumerGroupsOptions options) {
 
+		final List<String> groupIdsToDelete = new ArrayList<>(new HashSet<>(groupIds));
 		final Map<String, KafkaFutureImpl<Void>> groupFutures = new HashMap<>(groupIds.size());
 		for (String groupId : groupIds) {
 			groupFutures.put(groupId, new KafkaFutureImpl<>());
@@ -2287,7 +2287,7 @@ public class KafkaAdminClient extends AdminClient {
 
 			@Override
 			AbstractRequest.Builder createRequest(int timeoutMs) {
-				return new DeleteGroupsRequest.Builder(new ArrayList<>(groupIds));
+				return new DeleteGroupsRequest.Builder(groupIdsToDelete);
 			}
 
 			@Override
@@ -2295,25 +2295,27 @@ public class KafkaAdminClient extends AdminClient {
 				DeleteGroupsResponse response = (DeleteGroupsResponse) abstractResponse;
 				Map<String, Exception> errors = response.errors();
 				Exception exception = response.getException();
-				for (Map.Entry<String, KafkaFutureImpl<Void>> entry : groupFutures.entrySet()) {
-					String group = entry.getKey();
-					if (errors.containsKey(group)) {
-						if (errors.get(group) != null)
-							entry.getValue().completeExceptionally(errors.get(group));
-						else
-							entry.getValue().complete(null);
-					} else
-						entry.getValue().completeExceptionally(exception);
-				}
+				
+				if (exception == null || exception instanceof DisconnectException) {
+					for (Map.Entry<String, KafkaFutureImpl<Void>> entry : groupFutures.entrySet()) {
+						String group = entry.getKey();
+						if (errors.containsKey(group)) {
+							if (errors.get(group) != null)
+								entry.getValue().completeExceptionally(errors.get(group));
+							else
+								entry.getValue().complete(null);
+							groupIdsToDelete.remove(group);
+						}
+					}
+					if (exception instanceof DisconnectException)
+						this.fail(time.milliseconds(), exception);
+				} else
+					handleFailure(exception);
 			}
 
 			@Override
 			void handleFailure(Throwable throwable) {
-				if (throwable instanceof DisconnectException)
-					this.fail(now, throwable);
-				else {
-					completeAllExceptionally(groupFutures.values(), throwable);
-				}
+				completeAllExceptionally(groupFutures.values(), throwable);
 			}
 		}, now);
 
@@ -2348,14 +2350,13 @@ public class KafkaAdminClient extends AdminClient {
 					all.complete(consumerGroups);
 				} else {
 					handleFailure(response.getException());
-
 				}
 			}
 
 			@Override
 			void handleFailure(Throwable throwable) {
 				if (throwable instanceof DisconnectException)
-					this.fail(now, throwable);
+					this.fail(time.milliseconds(), throwable);
 				else
 					completeAllExceptionally(Collections.singletonList(all), throwable);
 			}
@@ -2436,19 +2437,67 @@ public class KafkaAdminClient extends AdminClient {
 					@Override
 					void handleFailure(Throwable throwable) {
 						if (throwable instanceof DisconnectException)
-							this.fail(now, throwable);
-						else {
-							for (Map.Entry<CoordinatorKey, KafkaFutureImpl<Map<TopicPartition, OffsetAndMetadata>>> entry : listOffsetResultFuturesMap
-									.entrySet()) {
-								entry.getValue().completeExceptionally(throwable);
-							}
-
-						}
+							this.fail(time.milliseconds(), throwable);
+						else
+							completeAllExceptionally(listOffsetResultFuturesMap.values(), throwable);
 					}
 				}, now);
 
 		ListConsumerGroupOffsetsResult result = ReflectionUtil.createInstance(ListConsumerGroupOffsetsResult.class,
 				new Class<?>[] { Map.class }, listOffsetResultFuturesMap);
+		return result;
+	}
+	
+	/**
+	 * This method is not yet supported.
+	 */
+	@Override
+	public CreatePartitionsResult createPartitions(Map<String, NewPartitions> newPartitions,
+			final CreatePartitionsOptions options) {
+		final Map<String, NewPartitions> newPartitionsRem = new HashMap<>(newPartitions);
+		final Map<String, KafkaFutureImpl<Void>> futures = new HashMap<>(newPartitions.size());
+		
+		for (String topic : newPartitions.keySet()) {
+			futures.put(topic, new KafkaFutureImpl<Void>());
+		}
+		final long now = time.milliseconds();
+		Call call = new Call("createPartitions", calcDeadlineMs(now, options.timeoutMs()), new LeastLoadedNodeProvider()) {
+
+			@Override
+			public AbstractRequest.Builder createRequest(int timeoutMs) {
+				return new CreatePartitionsRequest.Builder(newPartitionsRem);
+			}
+
+			@Override
+			public void handleResponse(org.apache.kafka.common.requests.AbstractResponse abstractResponse) {
+				CreatePartitionsResponse response = (CreatePartitionsResponse) abstractResponse;
+				Exception exception = response.getException();
+
+				if (exception == null || exception instanceof DisconnectException) {
+					for (Map.Entry<String, Exception> entry : response.getErrorsMap().entrySet()) {
+						KafkaFutureImpl<Void> future = futures.get(entry.getKey());
+						if (entry.getValue() == null)
+							future.complete(null);
+						else
+							future.completeExceptionally(entry.getValue());
+						newPartitionsRem.remove(entry.getKey());
+					}
+					if (exception instanceof DisconnectException)
+						this.fail(time.milliseconds(), exception);
+				} else
+					handleFailure(exception);
+			}
+
+			@Override
+			void handleFailure(Throwable throwable) {
+				completeAllExceptionally(futures.values(), throwable);
+			}
+		};
+		if (!newPartitions.isEmpty()) {
+			runnable.call(call, now);
+		}
+		CreatePartitionsResult result = ReflectionUtil.createInstance(CreatePartitionsResult.class,
+				new Class<?>[] { Map.class }, futures);
 		return result;
 	}
 	
@@ -2524,15 +2573,6 @@ public class KafkaAdminClient extends AdminClient {
 	@Override
 	public DescribeReplicaLogDirsResult describeReplicaLogDirs(Collection<TopicPartitionReplica> replicas,
 			DescribeReplicaLogDirsOptions options) {
-		throw new FeatureNotSupportedException("This feature is not suported for this release.");
-	}
-
-	/**
-	 * This method is not yet supported.
-	 */
-	@Override
-	public CreatePartitionsResult createPartitions(Map<String, NewPartitions> newPartitions,
-			final CreatePartitionsOptions options) {
 		throw new FeatureNotSupportedException("This feature is not suported for this release.");
 	}
 
@@ -2786,6 +2826,22 @@ public class KafkaAdminClient extends AdminClient {
 	 */
 	@Override
 	public ListClientMetricsResourcesResult listClientMetricsResources(ListClientMetricsResourcesOptions arg0) {
+		throw new FeatureNotSupportedException("This feature is not suported for this release.");
+	}
+
+	/**
+	 * This method is not yet supported.
+	 */
+	@Override
+	public AddRaftVoterResult addRaftVoter(int arg0, Uuid arg1, Set<RaftVoterEndpoint> arg2, AddRaftVoterOptions arg3) {
+		throw new FeatureNotSupportedException("This feature is not suported for this release.");
+	}
+
+	/**
+	 * This method is not yet supported.
+	 */
+	@Override
+	public RemoveRaftVoterResult removeRaftVoter(int arg0, Uuid arg1, RemoveRaftVoterOptions arg2) {
 		throw new FeatureNotSupportedException("This feature is not suported for this release.");
 	}
 

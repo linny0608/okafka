@@ -14,6 +14,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLSyntaxErrorException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -23,6 +24,7 @@ import java.util.Set;
 
 import org.apache.kafka.clients.ClientRequest;
 import org.apache.kafka.clients.ClientResponse;
+import org.apache.kafka.clients.admin.NewPartitions;
 import org.apache.kafka.clients.admin.internals.AdminMetadataManager;
 import org.oracle.okafka.clients.NetworkClient;
 import org.oracle.okafka.clients.admin.AdminClientConfig;
@@ -31,6 +33,8 @@ import org.oracle.okafka.common.errors.ConnectionException;
 import org.oracle.okafka.common.errors.InvalidLoginCredentialsException;
 import org.oracle.okafka.common.network.AQClient;
 import org.oracle.okafka.common.protocol.ApiKeys;
+import org.oracle.okafka.common.requests.CreatePartitionsRequest;
+import org.oracle.okafka.common.requests.CreatePartitionsResponse;
 import org.oracle.okafka.common.requests.CreateTopicsRequest;
 import org.oracle.okafka.common.requests.CreateTopicsResponse;
 import org.oracle.okafka.common.requests.DeleteGroupsRequest;
@@ -50,6 +54,9 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.errors.DisconnectException;
 import org.apache.kafka.common.errors.GroupIdNotFoundException;
+import org.apache.kafka.common.errors.InvalidPartitionsException;
+import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
+import org.apache.kafka.common.errors.UnsupportedVersionException;
 import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.common.utils.Time;
 
@@ -104,6 +111,8 @@ public class AQKafkaAdmin extends AQClient{
 			return getConsumerGroups(request);
 		if(key == ApiKeys.DELETE_GROUPS)
 			return deleteConsumerGroups(request);
+		if(key == ApiKeys.CREATE_PARTITIONS)
+			return createPartitions(request);
 		return null;
 		
 	}
@@ -120,23 +129,17 @@ public class AQKafkaAdmin extends AQClient{
 		 Connection jdbcConn = connections.get(node);		 
 		 Map<String, Exception> result = new HashMap<String, Exception>();
 		 Map<String, Uuid> topicIdMap = new HashMap<>();
-		 SQLException exception = null;
+		 Exception exception = null;
+		 boolean disconnected = false;
 		 try {			 			 
-			 result = CreateTopics.createTopics(jdbcConn, topics, topicIdMap) ;
-		 } catch(SQLException sql) {
-			 sql.printStackTrace();
-			 exception = sql;
-			 log.trace("Unexcepted error occured with connection to node {}, closing the connection", request.destination());
-			 log.trace("Failed to create topics {}", topics.keySet());
-			 try {
-				 jdbcConn.close(); 
-				 connections.remove(node);				 
-				 log.trace("Connection with node {} is closed", request.destination());
-			 } catch(SQLException sqlException) {
-				 log.trace("Failed to close connection with node {}", request.destination());
-			 }
+			 result = CreateTopics.createTopics(jdbcConn, topics, topicIdMap, log);
+		 } catch(Exception e) {
+			 log.error("Unexcepted error occured while creating topics",e);
+			 if(e instanceof DisconnectException)
+				 disconnected = true;
+			 exception = e; 
 		 } 
-		 return createTopicsResponse(result, exception, exception != null, request, topicIdMap);	 
+		 return createTopicsResponse(result, exception, disconnected, request, topicIdMap);	 
 	}
 	
 	@Override
@@ -178,14 +181,19 @@ public class AQKafkaAdmin extends AQClient{
 		 CallableStatement cStmt = null;
 		 Map<String, SQLException> result = new HashMap<>();
 		 Set<String> topicSet = new HashSet<>(topics);
-		 try {	
+		 boolean disconnected = false;
+		 try {
 			 cStmt = jdbcConn.prepareCall(query);
 			 for(String topic: topics) {
 				 try {
+					 log.debug("Deleting Topic: {}",topic);
 					 cStmt.setString(1, topic);
 					 cStmt.setInt(2, 1);
 					 cStmt.execute();  
+					 log.debug("Topic Deleted: {}",topic);
 				 } catch(SQLException sql) {
+					 if(ConnectionUtils.isConnectionClosed(jdbcConn))
+						 throw new DisconnectException("Database connection got severed while deleting topics",sql);
 					 log.trace("Failed to delete topic : {}", topic);
 					 result.put(topic, sql);
 				 }
@@ -194,26 +202,22 @@ public class AQKafkaAdmin extends AQClient{
 					 log.trace("Deleted a topic : {}", topic);
 					 result.put(topic, null);
 				 }
-				 
-			 } 
-		 } catch(SQLException sql) {
-			 log.trace("Unexcepted error occured with connection to node {}, closing the connection", node);
-			 log.trace("Failed to delete topics : {}", topicSet);
-			 try {
-				 connections.remove(node);
-				 jdbcConn.close(); 
-				 log.trace("Connection with node {} is closed", request.destination());
-			 } catch(SQLException sqlException) {
-				 log.trace("Failed to close connection with node {}", node);
 			 }
-			 return deleteTopicsResponse(result,Collections.emptyMap(), sql,true, request);
-		 }
-		 try {
-			 cStmt.close();
-		 } catch(SQLException sql) {
-			 //do nothing
-		 }
-		 return deleteTopicsResponse(result,Collections.emptyMap(), null, false, request);
+			 return deleteTopicsResponse(result, Collections.emptyMap(), null, false, request);
+		 } catch(Exception e) {
+			 log.error("Unexcepted error occured while deleting topics",e);
+			 log.trace("Failed to delete topics : {}", topicSet);
+			 if(e instanceof DisconnectException)
+				 disconnected = true;
+			 return deleteTopicsResponse(result, Collections.emptyMap(), e, disconnected, request);
+		 } finally {
+				try {
+					if(cStmt != null)
+						cStmt.close();
+				} catch (SQLException e) {
+					// do nothing
+				}
+		 } 
 	}
 	
 	private ClientResponse deleteTopicsById(ClientRequest request) {
@@ -224,6 +228,7 @@ public class AQKafkaAdmin extends AQClient{
 		 Connection jdbcConn = connections.get(node);
 		 Map<Uuid, SQLException> result = new HashMap<>();
 		 Set<Uuid> topicIdSet = new HashSet<>(topicIds);
+		 boolean disconnected = false;
 		 
 		 String query = "DECLARE\r\n"
 		 		+ "   id NUMBER := ?;\r\n"
@@ -241,11 +246,15 @@ public class AQKafkaAdmin extends AQClient{
 			 for(Uuid id: topicIds) {
 				 String topic;
 				 try {
+					 log.debug("Deleting Topic with id: {}",id);
 					 topic = ConnectionUtils.getTopicById(jdbcConn,id);
 					 cStmt.setInt(1, (int)id.getLeastSignificantBits());
 					 cStmt.setInt(2, 1);
-					 cStmt.execute();  
+					 cStmt.execute();
+					 log.debug("Deleted Topic with id: {}",id);
 				 } catch(SQLException sql) {
+					 if(ConnectionUtils.isConnectionClosed(jdbcConn))
+						 throw new DisconnectException("Database connection got severed while deleting topics", sql);
 					 log.trace("Failed to delete topic with id : {}", id);
 					 result.put(id, sql);
 				 }
@@ -255,26 +264,22 @@ public class AQKafkaAdmin extends AQClient{
 					 result.put(id, null);
 				 }
 				 
-			 } 
-		 } catch(SQLException sql) {
-			 log.trace("Unexcepted error occured with connection to node {}, closing the connection", node);
-			 log.trace("Failed to delete topics with Ids : {}", topicIdSet);
-			 try {
-				 connections.remove(node);
-				 jdbcConn.close(); 
-				 log.trace("Connection with node {} is closed", request.destination());
-			 } catch(SQLException sqlException) {
-				 log.trace("Failed to close connection with node {}", node);
 			 }
-			 return deleteTopicsResponse(Collections.emptyMap(), result, sql,true, request);
-		 }
-		 try {
-			 cStmt.close();
-		 } catch(SQLException sql) {
-			 //do nothing
-		 }
-		 return deleteTopicsResponse(Collections.emptyMap(),result, null, false, request);
-		 
+			 return deleteTopicsResponse(Collections.emptyMap(),result, null, false, request); 
+		 } catch(Exception e) {
+			 log.error("Unexcepted error occured while deleting topics",e);
+			 log.trace("Failed to delete topics with Ids : {}", topicIdSet);
+			 if(e instanceof DisconnectException)
+				 disconnected = true;
+			 return deleteTopicsResponse(Collections.emptyMap(), result, e, disconnected, request);
+			} finally {
+				try {
+					if (cStmt != null)
+						cStmt.close();
+				} catch (SQLException e) {
+					// do nothing
+				}
+			} 
 	}
 	
 	/**
@@ -294,22 +299,14 @@ public class AQKafkaAdmin extends AQClient{
 		Node node =(org.oracle.okafka.common.Node) metadataManager.nodeById(Integer.parseInt(request.destination()));
 		ClientResponse response = getMetadataNow(request, connections.get(node), node, forceMetadata);
 		if(response.wasDisconnected()) { 
-
-			connections.remove(node);
 			forceMetadata = true;
 		}
-		
 		return response;
 	}
 	
 	private ClientResponse listOffsets(ClientRequest request) {
 		Node node =(org.oracle.okafka.common.Node) metadataManager.nodeById(Integer.parseInt(request.destination()));
-		ClientResponse response = getOffsetsResponse(request,connections.get(node));
-		if(response.wasDisconnected()) { 
-			connections.remove(node);
-			forceMetadata = true;
-		}
-		
+		ClientResponse response = getOffsetsResponse(request,connections.get(node));		
 		return response;
 	}
 	
@@ -329,32 +326,20 @@ public class AQKafkaAdmin extends AQClient{
 			while (rs.next()) {
 				consumerGroups.add(rs.getString(1));
 			}
-
+		} catch (SQLException sqlE) {
+			exception = sqlE;
+			log.error("Exception caught while fetching Consumer Groups", sqlE);
+			if (ConnectionUtils.isConnectionClosed(jdbcConn)) {
+				disconnected = true;
+				exception = new DisconnectException(sqlE.getMessage(), sqlE);
+			}
+			log.trace("Failed to fetch Consumer Groups");
+		} finally {
 			try {
 				if (cStmt != null)
 					cStmt.close();
-			} catch (SQLException sql) {
+			} catch (SQLException e) {
 				// do nothing
-			}
-
-		} catch (SQLException sqlE) {
-			exception = sqlE;
-			
-			int errorCode = sqlE.getErrorCode();
-			log.error("ListGroup: SQL Error:ORA-" + errorCode,sqlE);
-			if (errorCode == 28 || errorCode == 17410) {
-				disconnected = true;
-				exception = new DisconnectException(sqlE.getMessage(),sqlE);
-			} 
-			
-			log.trace("Unexcepted error occured with connection to node {}, closing the connection", node);
-			log.trace("Failed to fetch Consumer Groups");
-			try {
-				connections.remove(node);
-				jdbcConn.close();
-				log.trace("Connection with node {} is closed", request.destination());
-			} catch (SQLException sqlException) {
-				log.trace("Failed to close connection with node {}", node);
 			}
 		}
 		ListGroupsResponse listGroupsResponse = new ListGroupsResponse(consumerGroups);
@@ -415,6 +400,7 @@ public class AQKafkaAdmin extends AQClient{
 							if (errorNo == 24010) {
 								validInvalidTopicPartitionMap.put(topic, -1);
 							}
+							else throw sqlE;
 						}
 					}
 					if (validInvalidTopicPartitionMap.get(topic) == -1 || validInvalidTopicPartitionMap.get(topic) <= tp.partition()) {
@@ -428,9 +414,8 @@ public class AQKafkaAdmin extends AQClient{
 						else
 							offsetFetchResponseMap.put(tp, null);
 					} catch (SQLException sqlE) {
-						int errorCode = sqlE.getErrorCode();
-						log.error("ListConsumerGroupOffset: SQL Error:ORA-" + errorCode, sqlE);
-						if (errorCode == 28 || errorCode == 17410) {
+						log.error("Exception caught while fetching committed offsets for topic: {}, partition: {}", tp.topic(), tp.partition() , sqlE);
+						if (ConnectionUtils.isConnectionClosed(jdbcConn)) {
 							disconnected = true;
 							throw new DisconnectException(sqlE.getMessage(),sqlE);
 						} else
@@ -441,30 +426,14 @@ public class AQKafkaAdmin extends AQClient{
 				responseMap.put(groupId, offsetFetchResponseMap);
 			}
 		} catch (Exception e) {
-			try {
 				exception = e;
 				if(e instanceof SQLException) {
-					int errorCode = ((SQLException)e).getErrorCode();
-					log.error("SQL Error:ORA-" + errorCode);
-					if (errorCode == 28 || errorCode == 17410) {
+					log.error("Exception caught while fetching committed offsets", e);
+					if (ConnectionUtils.isConnectionClosed(jdbcConn)) {
 						disconnected = true;
 						exception = new DisconnectException(e.getMessage(), e);
 					} 
 				}
-				log.debug("Unexcepted error occured with connection to node {}, closing the connection",
-						request.destination());
-				if (jdbcConn != null)
-					jdbcConn.close();
-
-				log.trace("Connection with node {} is closed", request.destination());
-			} catch (SQLException sqlEx) {
-				log.trace("Failed to close connection with node {}", request.destination());
-			}
-		}
-
-		if (disconnected) {
-			connections.remove(node);
-			forceMetadata = true;
 		}
 
 		OffsetFetchResponse offsetResponse = new OffsetFetchResponse(responseMap);
@@ -516,29 +485,17 @@ public class AQKafkaAdmin extends AQClient{
 			exception = sqlE;
 
 			if (sqlE.getErrorCode() == 6550) {
-				log.error("Not all privileges granted to the database user.",
-						sqlE.getMessage());
+				log.error("Not all privileges granted to the database user.", sqlE.getMessage());
 				log.info("Please grant all the documented privileges to database user.");
 				if (sqlE instanceof SQLSyntaxErrorException) {
 					log.trace("Please grant all the documented privileges to database user.");
 				}
 			}
 
-			int errorCode = sqlE.getErrorCode();
-			log.error("DeleteConsumerGroups: SQL Error:ORA-" + errorCode, sqlE);
-			if (errorCode == 28 || errorCode == 17410) {
+			log.error("Exception occured while deleting consumer groups", sqlE);
+			if (ConnectionUtils.isConnectionClosed(jdbcConn)) {
 				disconnected = true;
 				exception = new DisconnectException(sqlE.getMessage(), sqlE);
-			}
-			try {
-				log.debug("Unexcepted error occured with connection to node {}, closing the connection",
-						request.destination());
-				if (jdbcConn != null)
-					jdbcConn.close();
-
-				log.trace("Connection with node {} is closed", request.destination());
-			} catch (SQLException sqlEx) {
-				log.trace("Failed to close connection with node {}", request.destination());
 			}
 		} 
 		DeleteGroupsResponse deleteGroupsResponse = new DeleteGroupsResponse(errors);
@@ -546,6 +503,83 @@ public class AQKafkaAdmin extends AQClient{
 		return new ClientResponse(request.makeHeader((short) 1), request.callback(), request.destination(),
 				request.createdTimeMs(), System.currentTimeMillis(), disconnected, null, null, deleteGroupsResponse);
 		
+	}
+	
+	private ClientResponse createPartitions(ClientRequest request) {
+		CreatePartitionsRequest.Builder builder = (CreatePartitionsRequest.Builder) request.requestBuilder();
+		CreatePartitionsRequest createPartitionsRequest = builder.build();
+		Map<String, NewPartitions> partitionsNewCount = createPartitionsRequest.partitionNewCounts();
+		Map<String, Exception> errors = new HashMap<>();
+
+		Node node = (org.oracle.okafka.common.Node) metadataManager.nodeById(Integer.parseInt(request.destination()));
+		
+		Connection jdbcConn = connections.get(node);
+		Exception exception = null;
+		boolean disconnected = false;
+		
+		String plsql = 
+			    "BEGIN " +
+			    "  DBMS_AQADM.ADD_EVENTSTREAM( ?, ? ); " +
+			    "END;";
+		CallableStatement cStmt = null;
+		try {
+			for (Map.Entry<String, NewPartitions> entry : partitionsNewCount.entrySet()) {
+				String topic = entry.getKey();
+				int newPartitionCount = entry.getValue().totalCount();
+				int currentPartitionCount;
+				try {
+					currentPartitionCount = getQueueParameter(SHARDNUM_PARAM, topic, jdbcConn);
+
+					if (currentPartitionCount < newPartitionCount) {
+						cStmt = jdbcConn.prepareCall(plsql);
+						cStmt.setString(1, topic);
+						cStmt.setInt(2, newPartitionCount - currentPartitionCount);
+						log.debug("Adding {} more partitions to the topic {}.", newPartitionCount - currentPartitionCount, topic);
+						cStmt.execute();
+						log.debug("Successfully added {} partitions to the topic {}.", newPartitionCount - currentPartitionCount, topic);
+						errors.put(topic, null);
+					} else if (currentPartitionCount > newPartitionCount)
+						errors.put(topic, new InvalidPartitionsException(String.format("Topic currently has %d partitions, which is higher than the requested %d.",
+										currentPartitionCount, newPartitionCount)));
+					else
+						errors.put(topic, new InvalidPartitionsException(String.format("Topic already has %d partitions.", currentPartitionCount)));
+				} catch (SQLException sqlE) {
+					int errorNo = sqlE.getErrorCode();
+					if (errorNo == 24010) 
+						errors.put(topic, new UnknownTopicOrPartitionException("Topic does not exist",sqlE));
+					else
+						throw sqlE;
+				}
+			}
+
+		} catch (SQLException sqlE) {
+			log.error("Unexpected error occured while creating Partitions", sqlE);
+			exception = sqlE;
+			int errorNo = sqlE.getErrorCode();
+			if (errorNo == 6550) {
+				if (sqlE.getMessage().contains("PLS-00302")) {
+					log.error("This version of database does not support adding more partitions after the topic is created.");
+					exception = new UnsupportedVersionException(
+							"This version of database does not support adding more partitions after the topic is created.");
+				} else
+					log.error("Please grant all the documented privileges to the database user.", sqlE.getMessage());
+			}
+			if (ConnectionUtils.isConnectionClosed(jdbcConn)) {
+				disconnected = true;
+				exception = new DisconnectException("Database Connection got severed while creating Partitions.", sqlE);
+			}
+		} finally {
+			try {
+				if (cStmt != null)
+					cStmt.close();
+			} catch (SQLException sqlE) {
+				// do nothing
+			}
+		}
+		CreatePartitionsResponse createPartitionsResponse = new CreatePartitionsResponse(errors);
+		createPartitionsResponse.setException(exception);
+		return new ClientResponse(request.makeHeader((short) 1), request.callback(), request.destination(),
+				request.createdTimeMs(), System.currentTimeMillis(), disconnected, null, null, createPartitionsResponse); 
 	}
 	
 	/**
@@ -561,21 +595,22 @@ public class AQKafkaAdmin extends AQClient{
 			ConnectionUtils.updateNodeInfo(node, newConn);
 
 			/*
-			 * Fetching the nodes and updating the metadataManager to ensure that Cluster
+			 * Updating the metadataManager to ensure that Cluster
 			 * have the correct mapping in the nodesById Map even when the bootstrap node
 			 * have been updated after the initial connection
 			 */
-			if(node.isBootstrap()){
-				List<Node> nodes = new ArrayList<>();
-				String clusterId = ((oracle.jdbc.internal.OracleConnection) newConn).getServerSessionInfo()
-						.getProperty("DATABASE_NAME");
-				this.getNodes(nodes, newConn, node, forceMetadata);
-				for(Node n: nodes) {
-					n.setBootstrapFlag(false);
+			if (node.isBootstrap()) {
+				String clusterId = null;
+				try {
+					clusterId = ((oracle.jdbc.internal.OracleConnection) newConn).getServerSessionInfo()
+							.getProperty("DATABASE_NAME");
+				} catch (SQLException sql) {
+					if (ConnectionUtils.isConnectionClosed(newConn))
+						throw new ConnectionException("Database connection to the node " + node + "got severed.", sql);
 				}
-				Cluster newCluster = new Cluster(clusterId, NetworkClient.convertToKafkaNodes(nodes),
-						Collections.emptySet(), Collections.emptySet(), Collections.emptySet(),
-						nodes.size() > 0 ? nodes.get(0) : null);// , configs);
+				node.setBootstrapFlag(false);
+				Cluster newCluster = new Cluster(clusterId, NetworkClient.convertToKafkaNodes(Arrays.asList(node)),
+						Collections.emptySet(), Collections.emptySet(), Collections.emptySet(), node);
 				this.metadataManager.update(newCluster, System.currentTimeMillis());
 			}
 			connections.put(node, newConn);
@@ -620,7 +655,7 @@ public class AQKafkaAdmin extends AQClient{
 				connections.remove(node);
 				log.trace("Connection to node {} closed", node);
 			} catch(SQLException sql) {
-				
+				log.trace("Failed to close connection with node {}", node);
 			}
 			
 		}

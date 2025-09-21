@@ -30,12 +30,12 @@
 package org.oracle.okafka.common.requests;
 
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import org.oracle.okafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.protocol.ApiMessage;
 import org.apache.kafka.common.requests.AbstractResponse;
-import org.apache.kafka.common.utils.Utils;
 
 public class DeleteTopicsRequest extends AbstractRequest {
    
@@ -55,32 +55,26 @@ public class DeleteTopicsRequest extends AbstractRequest {
             this.timeout = timeout;
         }
         
-        @Override
-        public DeleteTopicsRequest build() {
-            return new DeleteTopicsRequest(topics, topicIds, timeout);
-        }
-        
     	@Override
 		public DeleteTopicsRequest build(short version) {
-			 return new DeleteTopicsRequest(topics,topicIds , timeout);
+			 return new DeleteTopicsRequest(topics,topicIds , timeout, version);
 		}
     	
-        @Override
-        public String toString() {
-            StringBuilder bld = new StringBuilder();
-            bld.append("(type=DeleteTopicsRequest").
-                append(topics!=null ? ", topics=(" : ", topic Ids=(").
-                append(topics!=null ? Utils.join(topics, ", ") : Utils.join(topicIds, ", ")).append(")").
-                append(", timeout=").append(timeout).
-                append(")");
-            return bld.toString();
-        }
-
+		@Override
+		public String toString() {
+			StringBuilder bld = new StringBuilder();
+			bld.append("(type=DeleteTopicsRequest").append(topics != null ? ", topics=(" : ", topic Ids=(")
+					.append(topics != null ? String.join(",", topics)
+							: topicIds.stream().map(Object::toString).collect(Collectors.joining(",")))
+					.append(")").append(", timeout=").append(timeout).append(")");
+			return bld.toString();
+		}
+        
 	
     }
 
-    private DeleteTopicsRequest(Set<String> topics, Set<Uuid> topicIds, Integer timeout) {
-    	super(ApiKeys.DELETE_TOPICS, (short)1);
+    private DeleteTopicsRequest(Set<String> topics, Set<Uuid> topicIds, Integer timeout, short version) {
+    	super(ApiKeys.DELETE_TOPICS, version);
         this.topics = topics;
         this.topicIds=topicIds;
         this.timeout = timeout;

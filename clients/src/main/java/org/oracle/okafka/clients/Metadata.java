@@ -323,10 +323,10 @@ public final class Metadata implements Closeable {
 		
 		boolean oldNodesAdded = false;
 		for(org.apache.kafka.common.Node oldNode : cluster.nodes())
-		{	
+		{
 			org.apache.kafka.common.Node nodeById = newCluster.nodeById(oldNode.id());
 			if(nodeById == null)
-			{	
+			{
 				newClusterNodes.add(oldNode);
 				//newCluster.nodes().add(oldNode);
 				oldNodesAdded = true;
@@ -365,9 +365,17 @@ public final class Metadata implements Closeable {
 				log.info("Cluster ID: {}", newClusterId);
 			clusterResourceListeners.onUpdate(newCluster.clusterResource());
 		}
-
+		
 		notifyAll();
 		log.debug("Updated cluster metadata version {} to {}", this.version, this.cluster);
+	}
+	
+	public void updateTeqParameters(Map<String, TopicTeqParameters> teqParams) {
+		for (Map.Entry<String, TopicTeqParameters> entry : teqParams.entrySet()) {
+			if (!this.topicParaMap.containsKey(entry.getKey())) {
+				topicParaMap.put(entry.getKey(), entry.getValue());
+			}
+		}
 	}
 
 	private  Node  getLeaderNode(Cluster oldCluster, Cluster newCluster)

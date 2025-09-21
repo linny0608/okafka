@@ -57,7 +57,6 @@ import org.apache.kafka.common.metrics.Metrics;
 import org.oracle.okafka.common.network.AQClient;
 import org.oracle.okafka.common.network.SelectorMetrics;
 import org.oracle.okafka.common.protocol.ApiKeys;
-import org.oracle.okafka.common.requests.MetadataResponse;
 import org.oracle.okafka.common.requests.ProduceRequest;
 import org.oracle.okafka.common.requests.ProduceResponse;
 import org.apache.kafka.common.record.MemoryRecords;
@@ -692,7 +691,6 @@ public final class AQKafkaProducer extends AQClient {
 			}
 			else if(disconnected)
 			{
-				TopicPublishers tpRemoved = topicPublishersMap.remove(node);
 				log.trace("Connection with node {} is closed", request.destination());
 				String exceptionMsg = "Database instance not reachable: " + node;
 				org.apache.kafka.common.errors.DisconnectException disconnExcp = new org.apache.kafka.common.errors.DisconnectException(exceptionMsg,pException);
@@ -778,7 +776,7 @@ public final class AQKafkaProducer extends AQClient {
 		msg.writeBytes(payload);
 		payload = null;
 		msg.setStringProperty("topic", topicPartition.topic());
-		msg.setStringProperty(AQClient.PARTITION_PROPERTY, Integer.toString(topicPartition.partition()*2));
+		msg.setLongProperty(PARTITION_PROPERTY, topicPartition.partition()*2);
 		msg.setIntProperty(MESSAGE_VERSION, 1);
 
 		return msg;
@@ -885,7 +883,7 @@ public final class AQKafkaProducer extends AQClient {
 		pBuffer.get(payload);
 		msg.writeBytes(payload);
 		payload = null;
-		msg.setStringProperty(PARTITION_PROPERTY, Integer.toString(topicPartition.partition()*2));
+		msg.setLongProperty(PARTITION_PROPERTY, topicPartition.partition()*2);
 		if(headers !=null)
 		{
 			msg.setIntProperty(HEADERCOUNT_PROPERTY, headers.length);
@@ -1017,26 +1015,8 @@ public final class AQKafkaProducer extends AQClient {
 			}
 		}
 
-
 		ClientResponse response = getMetadataNow(request, conn, node, metadata.updateRequested());
-
-		MetadataResponse metadataresponse = (MetadataResponse)response.responseBody();
-
-		org.apache.kafka.common.Cluster updatedCluster = metadataresponse.cluster();
-
-		for(String topic: updatedCluster.topics()) {
-			try {
-				super.fetchQueueParameters(topic, conn, metadata.topicParaMap);
-			} catch (SQLException e) {
-				log.error("Exception while fetching TEQ parameters and updating metadata " + e.getMessage());
-			}
-		}
-
-
-		if(response.wasDisconnected()) {
-			topicPublishersMap.remove(metadata.getNodeById(Integer.parseInt(request.destination())));
-			metadata.requestUpdate();
-		}
+		
 		return response;
 	}
 
@@ -1053,9 +1033,9 @@ public final class AQKafkaProducer extends AQClient {
 
 	//Close publishers for this node only
 	public void close(Node node) {
-
 		TopicPublishers tpNode = topicPublishersMap.get(node);
 		close(node, tpNode);
+		topicPublishersMap.remove(node);
 	}
 
 	public boolean isClosed()
@@ -1079,12 +1059,14 @@ public final class AQKafkaProducer extends AQClient {
 			}
 		}
 		try {
-			publishers.getSession().close();
+			if (publishers.getSession() != null)
+				publishers.getSession().close();
 		} catch(JMSException jms) {
 			log.error("failed to close session {} associated with connection {} and node {}  ",publishers.getSession(), publishers.getConnection(), node );
 		}
 		try {
-			publishers.getConnection().close();
+			if (publishers.getConnection() != null)
+				publishers.getConnection().close();
 			this.selectorMetrics.connectionClosed.record();
 		} catch(JMSException jms) {
 			log.error("failed to close connection {} associated with node {}  ",publishers.getConnection(), node );
