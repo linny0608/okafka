@@ -326,7 +326,6 @@ public final class AQKafkaConsumer extends AQClient{
 					Boolean ltwtSub = configs.getBoolean(ConsumerConfig.ORACLE_CONSUMER_LIGHTWEIGHT);
 					if(!ltwtSub.equals(true)) {
 						jmsSession = consumers.getSession();
-						
 						if(jmsSession != null)
 						{
 							log.debug("Committing now for node " + node.toString());
